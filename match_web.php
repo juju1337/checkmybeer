@@ -211,7 +211,10 @@ $syncUrl = 'sync_web.php?token=' . rawurlencode($expected);
     summary  { cursor: pointer; color: #666; font-size: .85em; }
     details label { display: block; padding: .3em 0; font-size: .95em; }
     .live-search { margin: .35em 0 0 1.1em; }
+<<<<<<< HEAD
     .live-label { display: block; color: #888; font-size: .8em; margin-bottom: .15em; }
+=======
+>>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
     .live-hit { display: flex; align-items: baseline; gap: .4em; padding: .2em 0; }
     .live-hit .hit { font-size: .95em; }
     .ulink    { font-size: .8em; color: #b8791a; text-decoration: none; white-space: nowrap;
@@ -407,11 +410,16 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
             }
             html += '</div>';
 
+<<<<<<< HEAD
             if (r.status !== 'sicher') {
                 const label = best ? '<span class="live-label">Untappd-Katalogsuche zur Kontrolle:</span>' : '';
                 html += '<div class="live-search">' + label
                      + '<div class="live-results" data-pending="1"><span class="meta">Untappd wird durchsucht …</span></div>'
                      + '</div>';
+=======
+            if (!best) {
+                html += '<div class="live-search" data-pending="1"><span class="meta">Untappd wird durchsucht …</span></div>';
+>>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
             }
 
             // Zeile 2: Auswahl – immer eingeklappt, auch bei unsicherem Treffer
@@ -466,8 +474,13 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
 
             resultsEl.appendChild(row);
 
+<<<<<<< HEAD
             if (r.status !== 'sicher') {
                 liveSearchQueue.push({ container: row.querySelector('.live-results'), query: r.input });
+=======
+            if (!best) {
+                liveSearchQueue.push({ container: row.querySelector('.live-search'), query: r.input });
+>>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
             }
         });
 
