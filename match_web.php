@@ -155,9 +155,12 @@ if ($action !== '') {
 // Seite ausliefern
 // ---------------------------------------------------------------
 try {
-    $cacheCount = count(loadHistory($config['history_csv']));
+    $historyBeers = loadHistory($config['history_csv']);
+    $cacheCount   = count($historyBeers);
+    $knownIds     = array_keys($historyBeers);
 } catch (RuntimeException $e) {
     $cacheCount = 0;
+    $knownIds   = [];
 }
 
 // Alter des Caches für den Sync-Hinweis
@@ -211,12 +214,10 @@ $syncUrl = 'sync_web.php?token=' . rawurlencode($expected);
     summary  { cursor: pointer; color: #666; font-size: .85em; }
     details label { display: block; padding: .3em 0; font-size: .95em; }
     .live-search { margin: .35em 0 0 1.1em; }
-<<<<<<< HEAD
-    .live-label { display: block; color: #888; font-size: .8em; margin-bottom: .15em; }
-=======
->>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
     .live-hit { display: flex; align-items: baseline; gap: .4em; padding: .2em 0; }
     .live-hit .hit { font-size: .95em; }
+    .live-hit-drunk { background: #eaf7ea; border-radius: 4px; padding-left: .3em; }
+    .drunk-check { flex: none; color: #1a7a1a; font-weight: 700; }
     .ulink    { font-size: .8em; color: #b8791a; text-decoration: none; white-space: nowrap;
                 border: 1px solid #e0b070; border-radius: 999px; padding: .05em .45em; margin-left: .3em;
                 flex: none; }
@@ -263,7 +264,9 @@ const TOKEN = <?= json_encode($expected) ?>;
 const CFG   = <?= json_encode([
     'clientId'     => $config['client_id'],
     'clientSecret' => $config['client_secret'],
+    'knownIds'     => $knownIds,
 ]) ?>;
+const KNOWN_IDS = new Set(CFG.knownIds);
 
 async function post(action, body) {
     const response = await fetch('match_web.php?token=' + encodeURIComponent(TOKEN) + '&action=' + action, {
@@ -320,27 +323,40 @@ async function untappdSearch(query) {
     return jsonp(url);
 }
 
-function renderLiveResults(container, data) {
-    const meta  = data && data.meta ? data.meta : {};
+// Rendert die Katalog-Kandidaten und markiert jeden, der laut KNOWN_IDS
+// bereits in deiner Historie steckt (rein informativ, Häkchen). Für die
+// automatische Übernahme als "sicher" zählt dagegen NUR, ob der von
+// Untappd am höchsten eingestufte Treffer (Position 0) bekannt ist – ein
+// zufällig weiter unten stehender bekannter Treffer soll nicht automatisch
+// bestätigen, dass er zu DIESER Zeile gehört (z.B. "Blue Brew" durfte nicht
+// automatisch auf einen anderen, nur zufällig ähnlich benannten und
+// bereits getrunkenen Sour derselben Brauerei matchen).
+// Rückgabe: { status, topRankedDrunkItem }.
+function renderCatalogResults(container, data) {
+    const meta = data && data.meta ? data.meta : {};
     if (meta.code !== 200) {
         const rateLimited = meta.code === 429 || /limit/i.test(meta.error_detail || '');
         container.innerHTML = '<span class="meta">'
             + (rateLimited ? 'Untappd-Rate-Limit erreicht – bitte später erneut versuchen.'
                            : 'Untappd-Suche fehlgeschlagen.')
             + '</span>';
-        return rateLimited ? 'rate_limited' : 'error';
+        return { status: rateLimited ? 'rate_limited' : 'error', topRankedDrunkItem: null };
     }
 
     const items = (((data.response || {}).beers || {}).items) || [];
     if (items.length === 0) {
         container.innerHTML = '<span class="meta">Kein Untappd-Treffer.</span>';
-        return 'ok';
+        return { status: 'ok', topRankedDrunkItem: null, hasResults: false };
     }
+
+    const topRankedDrunkItem = (items[0] && items[0].beer && KNOWN_IDS.has(items[0].beer.bid)) ? items[0] : null;
 
     let html = '';
     items.slice(0, 3).forEach(item => {
         const beer = item.beer || {}, brewery = item.brewery || {};
-        html += '<div class="live-hit">'
+        const isKnown = beer && KNOWN_IDS.has(beer.bid);
+        html += '<div class="live-hit' + (isKnown ? ' live-hit-drunk' : '') + '">'
+             + (isKnown ? '<span class="drunk-check" title="Bereits in deiner Historie">✓</span>' : '')
              + '<span class="hit">' + esc(beer.beer_name || '?') + ' <span class="meta">· '
              + esc(brewery.brewery_name || '') + ' · ' + esc(beer.beer_style || '') + '</span></span>'
              + '<a class="ulink" href="https://untappd.com/beer/' + (beer.bid || '')
@@ -348,29 +364,133 @@ function renderLiveResults(container, data) {
              + '</div>';
     });
     container.innerHTML = html;
-    return 'ok';
+    return { status: 'ok', topRankedDrunkItem, hasResults: true };
 }
 
-// Sucht nacheinander (nicht parallel) – schont das Stundenlimit und bricht
-// bei einem Rate-Limit sauber ab, statt alle restlichen Zeilen scheitern zu lassen.
-async function runLiveSearches(containers) {
-    for (const { container, query } of containers) {
-        const data = await untappdSearch(query);
-        const status = renderLiveResults(container, data);
-        delete container.dataset.pending;   // fertig – egal ob Treffer, leer oder Fehler
+// Baut den kompletten Zeileninhalt aus dem aktuellen (ggf. durch die
+// Katalogprüfung aktualisierten) Zustand von r. Wird sowohl beim ersten
+// Rendern als auch nach der Katalogverifikation erneut aufgerufen.
+function buildRowHtml(r, i) {
+    const selected = r.candidates.find(c => c.beer_id === r.selectedId);
+
+    let html = '<div class="line1">'
+         + '<span class="status-mark ' + r.status + '">' + (r.status === 'neu' ? 'NEU' : '') + '</span>'
+         + '<span class="input">' + esc(r.input) + '</span>';
+
+    if (selected) {
+        html += '<span class="arrow">→</span>'
+             + '<span class="hit">' + esc(selected.name) + ' <span class="meta">· '
+             + esc(selected.brewery) + '</span></span>'
+             + (selected.score != null ? '<span class="score">' + Math.round(selected.score * 100) + '%</span>' : '')
+             + '<a class="ulink" href="https://untappd.com/beer/' + selected.beer_id
+             + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>';
+    } else {
+        html += '<span class="hit new-hit">noch nicht getrunken</span>'
+             + '<a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
+             + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a>';
+    }
+    html += '</div>';
+
+    html += '<div class="live-search"><div class="live-results"' + (r._liveHtml ? '' : ' data-pending="1"') + '>'
+         + (r._liveHtml || '<span class="meta">Untappd-Katalog wird geprüft …</span>')
+         + '</div></div>';
+
+    if (r.candidates.length > 0) {
+        html += '<details><summary>'
+             + (r.candidates.length > 1 ? r.candidates.length + ' Treffer – ändern' : 'ändern')
+             + '</summary>';
+
+        r.candidates.forEach(c => {
+            const checked = c.beer_id === r.selectedId ? 'checked' : '';
+            html += '<label><input type="radio" name="m' + i + '" value="' + c.beer_id + '" ' + checked + '> '
+                 + esc(c.name) + ' <span class="meta">· ' + esc(c.brewery) + (c.style ? ' · ' + esc(c.style) : '') + '</span>'
+                 + (c.score != null ? ' <span class="score">' + Math.round(c.score * 100) + '%</span>' : ' <span class="meta">(Katalog)</span>')
+                 + ' <a class="ulink" href="https://untappd.com/beer/' + c.beer_id
+                 + '" target="_blank" rel="noopener noreferrer">↗</a></label>';
+        });
+
+        html += '<label><input type="radio" name="m' + i + '" value="0" ' + (r.selectedId === 0 ? 'checked' : '') + '> '
+             + '<em>Noch nicht getrunken / kein Treffer</em>'
+             + ' <a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
+             + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a></label>';
+        html += '</details>';
+    } else {
+        html += '<input type="radio" name="m' + i + '" value="0" checked hidden>';
+    }
+
+    return html;
+}
+
+// Prüft jede Zeile gegen den echten Katalog und gleicht die gefundene(n)
+// Bier-ID(s) exakt gegen deine Historie ab (KNOWN_IDS) – das ersetzt die
+// unscharfe lokale Vermutung durch einen echten Ja/Nein-Abgleich, sobald
+// das Ergebnis da ist. Läuft nacheinander (Rate-Limit-Schonung) und bricht
+// bei einem Limit sauber ab, ohne bereits Geprüftes zu verwerfen.
+async function verifyRowsAgainstCatalog(rows) {
+    for (const { row, r, i } of rows) {
+        const container = row.querySelector('.live-results');
+        const data = await untappdSearch(r.input);
+        const { status, topRankedDrunkItem, hasResults } = renderCatalogResults(container, data);
+        r._liveHtml = container.innerHTML;
+        container.removeAttribute('data-pending');   // fertig – dieser Container zählt nicht mehr als "offen"
 
         if (status === 'rate_limited') {
-            containers.forEach(c => {
-                if (c.container.dataset.pending) {
-                    c.container.innerHTML = '<span class="meta">Nicht mehr durchsucht (Rate-Limit) – '
+            rows.forEach(({ row: pendingRow }) => {
+                const c = pendingRow.querySelector('.live-results[data-pending]');
+                if (c) {
+                    c.innerHTML = '<span class="meta">Nicht mehr geprüft (Rate-Limit) – '
                         + 'manuell über die Suche prüfen.</span>';
                 }
             });
-            return;
+            break;
         }
-        await new Promise(r => setTimeout(r, 250));   // kleine Pause zwischen Anfragen
+
+        // Nur automatisch übernehmen, wenn die Person diese Zeile noch nicht
+        // selbst verändert hat (ein Klick soll nie überschrieben werden) und
+        // die Suche selbst geklappt hat (bei einem Fehler bleibt der lokale
+        // Stand einfach unverändert stehen).
+        if (status === 'ok' && !row.dataset.userTouched) {
+            if (topRankedDrunkItem) {
+                // Bester Katalogtreffer ist in deiner Historie -> sicher bestätigt.
+                const beer = topRankedDrunkItem.beer, brewery = topRankedDrunkItem.brewery || {};
+                if (!r.candidates.some(c => c.beer_id === beer.bid)) {
+                    r.candidates.unshift({
+                        beer_id: beer.bid, name: beer.beer_name, brewery: brewery.brewery_name || '',
+                        style: beer.beer_style || '', score: null,
+                    });
+                }
+                r.status = 'sicher';
+                r.selectedId = beer.bid;
+            } else if (hasResults) {
+                // Katalog kennt Kandidaten für diese Zeile, aber keiner davon
+                // ist in deiner Historie -> zuverlässig "noch nicht getrunken",
+                // auch wenn der lokale Abgleich vorher unsicher (oder fälschlich
+                // sicher) war. Das ist der eigentliche Zweck der Katalogprüfung.
+                r.status = 'neu';
+                r.selectedId = 0;
+            }
+            // Sonst (Katalog fand überhaupt nichts): keine zusätzliche
+            // Information -> lokalen Stand unverändert lassen.
+
+            row.className = 'row' + (r.status === 'neu' ? ' neu-row' : '');
+            row.innerHTML = buildRowHtml(r, i);
+        }
+
+        updateCounts();
+        await new Promise(res => setTimeout(res, 250));   // kleine Pause zwischen Anfragen
     }
 }
+
+let currentResults = [];
+
+function updateCounts() {
+    const counts = currentResults.reduce((acc, r) => { acc[r.status]++; return acc; },
+        { sicher: 0, unsicher: 0, neu: 0 });
+    document.getElementById('counts').innerHTML =
+        counts.sicher + ' Treffer · ' + counts.unsicher + ' zu prüfen · '
+        + '<span class="new-count">' + counts.neu + ' noch nicht getrunken</span>';
+}
+
 
 document.getElementById('matchBtn').addEventListener('click', async () => {
     const lines = document.getElementById('beerlist').value.split('\n');
@@ -382,76 +502,28 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
     try {
         const { results } = await post('match', { lines });
         resultsEl.innerHTML = '';
-        const liveSearchQueue = [];
+        currentResults = results;
+        const verifyQueue = [];
 
         results.forEach((r, i) => {
             const row = document.createElement('div');
             row.className = 'row' + (r.status === 'neu' ? ' neu-row' : '');
             row.dataset.input = r.input;
 
-            const best = r.candidates[0];
+            // "sicher" startet vorausgewählt mit dem Top-Kandidaten, sonst
+            // ist "noch nicht getrunken" der sichere Default – siehe unten
+            // beim Katalogabgleich, der das ggf. überschreibt.
+            r.selectedId = (r.status === 'sicher' && r.candidates[0]) ? r.candidates[0].beer_id : 0;
 
-            // Zeile 1: Status-Markierung, Eingabe, bester Treffer (bzw. Untappd-Suche)
-            let html = '<div class="line1">'
-                 + '<span class="status-mark ' + r.status + '">' + (r.status === 'neu' ? 'NEU' : '') + '</span>'
-                 + '<span class="input">' + esc(r.input) + '</span>';
+            row.innerHTML = buildRowHtml(r, i);
 
-            if (best) {
-                html += '<span class="arrow">→</span>'
-                     + '<span class="hit">' + esc(best.name) + ' <span class="meta">· '
-                     + esc(best.brewery) + '</span></span>'
-                     + '<span class="score">' + Math.round(best.score * 100) + '%</span>'
-                     + '<a class="ulink" href="https://untappd.com/beer/' + best.beer_id
-                     + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>';
-            } else {
-                html += '<span class="hit new-hit">noch nicht getrunken</span>'
-                     + '<a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
-                     + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a>';
-            }
-            html += '</div>';
-
-<<<<<<< HEAD
-            if (r.status !== 'sicher') {
-                const label = best ? '<span class="live-label">Untappd-Katalogsuche zur Kontrolle:</span>' : '';
-                html += '<div class="live-search">' + label
-                     + '<div class="live-results" data-pending="1"><span class="meta">Untappd wird durchsucht …</span></div>'
-                     + '</div>';
-=======
-            if (!best) {
-                html += '<div class="live-search" data-pending="1"><span class="meta">Untappd wird durchsucht …</span></div>';
->>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
-            }
-
-            // Zeile 2: Auswahl – immer eingeklappt, auch bei unsicherem Treffer
-            if (best) {
-                html += '<details><summary>'
-                     + (r.candidates.length > 1 ? r.candidates.length + ' Treffer – ändern' : 'ändern')
-                     + '</summary>';
-
-                r.candidates.forEach((c, j) => {
-                    const checked = j === 0 ? 'checked' : '';
-                    html += '<label><input type="radio" name="m' + i + '" value="' + c.beer_id + '" ' + checked + '> '
-                         + esc(c.name) + ' <span class="meta">· ' + esc(c.brewery) + ' · ' + esc(c.style) + '</span>'
-                         + ' <span class="score">' + Math.round(c.score * 100) + '%</span>'
-                         + ' <a class="ulink" href="https://untappd.com/beer/' + c.beer_id
-                         + '" target="_blank" rel="noopener noreferrer">↗</a></label>';
-                });
-
-                html += '<label><input type="radio" name="m' + i + '" value="0"> '
-                     + '<em>Noch nicht getrunken / kein Treffer</em>'
-                     + ' <a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
-                     + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a></label>';
-                html += '</details>';
-            } else {
-                // Ohne Kandidaten: unsichtbare Vorauswahl "kein Treffer"
-                html += '<input type="radio" name="m' + i + '" value="0" checked hidden>';
-            }
-
-            row.innerHTML = html;
-
-            // Auswahl ändern -> Kopfzeile der Zeile mitziehen
+            // Auswahl ändern -> Kopfzeile der Zeile mitziehen, und als von
+            // der Person bearbeitet markieren (Katalogabgleich überschreibt
+            // dann keine manuelle Entscheidung mehr).
             row.addEventListener('change', e => {
                 if (e.target.type !== 'radio') return;
+                row.dataset.userTouched = '1';
+
                 const id   = parseInt(e.target.value, 10);
                 const hit  = row.querySelector('.line1 .hit');
                 const mark = row.querySelector('.status-mark');
@@ -463,37 +535,27 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
                     mark.className = 'status-mark sicher';
                     mark.textContent = '';
                     row.classList.remove('neu-row');
+                    r.status = 'sicher';
                 } else {
                     hit.className = 'hit new-hit';
                     hit.textContent = 'noch nicht getrunken';
                     mark.className = 'status-mark neu';
                     mark.textContent = 'NEU';
                     row.classList.add('neu-row');
+                    r.status = 'neu';
                 }
+                updateCounts();
             });
 
             resultsEl.appendChild(row);
-
-<<<<<<< HEAD
-            if (r.status !== 'sicher') {
-                liveSearchQueue.push({ container: row.querySelector('.live-results'), query: r.input });
-=======
-            if (!best) {
-                liveSearchQueue.push({ container: row.querySelector('.live-search'), query: r.input });
->>>>>>> ff7dc194eb4cbeede8646b67c228815934459aac
-            }
+            verifyQueue.push({ row, r, i });
         });
 
-        const counts = results.reduce((acc, r) => { acc[r.status]++; return acc; },
-            { sicher: 0, unsicher: 0, neu: 0 });
-        document.getElementById('counts').innerHTML =
-            counts.sicher + ' Treffer · ' + counts.unsicher + ' zu prüfen · '
-            + '<span class="new-count">' + counts.neu + ' noch nicht getrunken</span>';
-
+        updateCounts();
         document.getElementById('saveBtn').style.display = results.length ? 'inline-block' : 'none';
 
-        if (liveSearchQueue.length > 0) {
-            runLiveSearches(liveSearchQueue);   // läuft im Hintergrund weiter
+        if (verifyQueue.length > 0) {
+            verifyRowsAgainstCatalog(verifyQueue);   // läuft im Hintergrund weiter
         }
     } catch (e) {
         resultsEl.innerHTML = '<span class="error">FEHLER: ' + esc(e.message) + '</span>';
