@@ -99,6 +99,36 @@ if ($action !== '') {
         exit(json_encode(['ok' => true, 'results' => $results]));
     }
 
+    if ($action === 'rerank') {
+        // Sortiert einen Pool von Katalog-Kandidaten (von Untappds eigener
+        // Suche geliefert) nach Textähnlichkeit zur ursprünglichen Zeile neu.
+        // Untappds Suche ist gut darin, überhaupt passende Kandidaten zu
+        // FINDEN, aber ihre Rangfolge stimmt nicht immer mit der reinen
+        // Textähnlichkeit überein – dafür nutzen wir denselben, bereits
+        // getesteten Scorer wie beim lokalen Historienabgleich.
+        $query = trim((string) ($payload['query'] ?? ''));
+        $items = $payload['items'] ?? [];
+        if ($query === '' || !is_array($items)) {
+            http_response_code(400);
+            exit(json_encode(['ok' => false, 'error' => 'query und items erforderlich.']));
+        }
+
+        $queryTokens = matchTokens($query);
+        $scored      = [];
+
+        foreach ($items as $item) {
+            if (!is_array($item) || !isset($item['bid'])) {
+                continue;
+            }
+            $targetTokens = matchTokens(($item['name'] ?? '') . ' ' . ($item['brewery'] ?? ''));
+            $scored[] = $item + ['score' => round(scoreMatch($queryTokens, $targetTokens), 3)];
+        }
+
+        usort($scored, fn($a, $b) => $b['score'] <=> $a['score']);
+
+        exit(json_encode(['ok' => true, 'items' => $scored]));
+    }
+
     if ($action === 'save') {
         $rows = $payload['rows'] ?? [];
         if (!is_array($rows)) {
@@ -323,43 +353,75 @@ async function untappdSearch(query) {
     return jsonp(url);
 }
 
-// Rendert die Katalog-Kandidaten und markiert jeden, der laut KNOWN_IDS
-// bereits in deiner Historie steckt (rein informativ, Häkchen). Für die
-// automatische Übernahme als "sicher" zählt dagegen NUR, ob der von
-// Untappd am höchsten eingestufte Treffer (Position 0) bekannt ist – ein
-// zufällig weiter unten stehender bekannter Treffer soll nicht automatisch
-// bestätigen, dass er zu DIESER Zeile gehört (z.B. "Blue Brew" durfte nicht
-// automatisch auf einen anderen, nur zufällig ähnlich benannten und
-// bereits getrunkenen Sour derselben Brauerei matchen).
-// Rückgabe: { status, topRankedDrunkItem }.
-function renderCatalogResults(container, data) {
+// Holt Katalogkandidaten von Untappd und sortiert sie nach Textähnlichkeit
+// zur ursprünglichen Zeile neu. Untappds eigene Suche ist gut darin,
+// überhaupt passende Kandidaten zu FINDEN, aber ihre interne Rangfolge
+// stimmt nicht immer mit reiner Textähnlichkeit überein (z.B. "DDF M*rs"
+// vor "Double M*rs" bei der Anfrage "Double Mars") – dafür nutzt der
+// Server denselben, bereits getesteten Scorer wie beim lokalen Abgleich.
+async function searchAndRerank(query) {
+    const data = await untappdSearch(query);
     const meta = data && data.meta ? data.meta : {};
     if (meta.code !== 200) {
         const rateLimited = meta.code === 429 || /limit/i.test(meta.error_detail || '');
-        container.innerHTML = '<span class="meta">'
-            + (rateLimited ? 'Untappd-Rate-Limit erreicht – bitte später erneut versuchen.'
-                           : 'Untappd-Suche fehlgeschlagen.')
-            + '</span>';
-        return { status: rateLimited ? 'rate_limited' : 'error', topRankedDrunkItem: null };
+        return { status: rateLimited ? 'rate_limited' : 'error', items: [] };
     }
 
-    const items = (((data.response || {}).beers || {}).items) || [];
+    const rawItems = (((data.response || {}).beers || {}).items) || [];
+    if (rawItems.length === 0) {
+        return { status: 'ok', items: [] };
+    }
+
+    const simplified = rawItems.slice(0, 10).map(item => ({
+        bid: (item.beer || {}).bid,
+        name: (item.beer || {}).beer_name || '?',
+        brewery: (item.brewery || {}).brewery_name || '',
+        style: (item.beer || {}).beer_style || '',
+    })).filter(it => it.bid);
+
+    try {
+        const result = await post('rerank', { query, items: simplified });
+        return { status: 'ok', items: result.items };
+    } catch (e) {
+        // Neusortierung fehlgeschlagen (z.B. Serverproblem) -> Untappds
+        // eigene Reihenfolge als Fallback, besser als gar nichts.
+        return { status: 'ok', items: simplified.map(it => ({ ...it, score: null })) };
+    }
+}
+
+// Rendert die Katalog-Kandidaten (bereits nach Textähnlichkeit sortiert)
+// und markiert jeden, der laut KNOWN_IDS bereits in deiner Historie steckt
+// (rein informativ, Häkchen). Für die automatische Übernahme als "sicher"
+// zählt dagegen NUR, ob der nach unserer eigenen Sortierung beste Treffer
+// (Position 0) bekannt ist – ein zufällig weiter unten stehender bekannter
+// Treffer soll nicht automatisch bestätigen, dass er zu DIESER Zeile gehört.
+// Rückgabe: { status, topRankedDrunkItem, hasResults }.
+function renderCatalogResults(container, result) {
+    if (result.status === 'rate_limited' || result.status === 'error') {
+        container.innerHTML = '<span class="meta">'
+            + (result.status === 'rate_limited' ? 'Untappd-Rate-Limit erreicht – bitte später erneut versuchen.'
+                                                 : 'Untappd-Suche fehlgeschlagen.')
+            + '</span>';
+        return { status: result.status, topRankedDrunkItem: null, hasResults: false };
+    }
+
+    const items = result.items;
     if (items.length === 0) {
         container.innerHTML = '<span class="meta">Kein Untappd-Treffer.</span>';
         return { status: 'ok', topRankedDrunkItem: null, hasResults: false };
     }
 
-    const topRankedDrunkItem = (items[0] && items[0].beer && KNOWN_IDS.has(items[0].beer.bid)) ? items[0] : null;
+    const topRankedDrunkItem = KNOWN_IDS.has(items[0].bid) ? items[0] : null;
 
     let html = '';
-    items.slice(0, 3).forEach(item => {
-        const beer = item.beer || {}, brewery = item.brewery || {};
-        const isKnown = beer && KNOWN_IDS.has(beer.bid);
+    items.slice(0, 3).forEach(it => {
+        const isKnown = KNOWN_IDS.has(it.bid);
         html += '<div class="live-hit' + (isKnown ? ' live-hit-drunk' : '') + '">'
              + (isKnown ? '<span class="drunk-check" title="Bereits in deiner Historie">✓</span>' : '')
-             + '<span class="hit">' + esc(beer.beer_name || '?') + ' <span class="meta">· '
-             + esc(brewery.brewery_name || '') + ' · ' + esc(beer.beer_style || '') + '</span></span>'
-             + '<a class="ulink" href="https://untappd.com/beer/' + (beer.bid || '')
+             + '<span class="hit">' + esc(it.name) + ' <span class="meta">· '
+             + esc(it.brewery) + ' · ' + esc(it.style) + '</span></span>'
+             + (it.score != null ? '<span class="score">' + Math.round(it.score * 100) + '%</span>' : '')
+             + '<a class="ulink" href="https://untappd.com/beer/' + it.bid
              + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>'
              + '</div>';
     });
@@ -429,8 +491,8 @@ function buildRowHtml(r, i) {
 async function verifyRowsAgainstCatalog(rows) {
     for (const { row, r, i } of rows) {
         const container = row.querySelector('.live-results');
-        const data = await untappdSearch(r.input);
-        const { status, topRankedDrunkItem, hasResults } = renderCatalogResults(container, data);
+        const result = await searchAndRerank(r.input);
+        const { status, topRankedDrunkItem, hasResults } = renderCatalogResults(container, result);
         r._liveHtml = container.innerHTML;
         container.removeAttribute('data-pending');   // fertig – dieser Container zählt nicht mehr als "offen"
 
@@ -451,16 +513,17 @@ async function verifyRowsAgainstCatalog(rows) {
         // Stand einfach unverändert stehen).
         if (status === 'ok' && !row.dataset.userTouched) {
             if (topRankedDrunkItem) {
-                // Bester Katalogtreffer ist in deiner Historie -> sicher bestätigt.
-                const beer = topRankedDrunkItem.beer, brewery = topRankedDrunkItem.brewery || {};
-                if (!r.candidates.some(c => c.beer_id === beer.bid)) {
+                // Bester Katalogtreffer (nach unserer eigenen Sortierung!) ist
+                // in deiner Historie -> sicher bestätigt.
+                const it = topRankedDrunkItem;
+                if (!r.candidates.some(c => c.beer_id === it.bid)) {
                     r.candidates.unshift({
-                        beer_id: beer.bid, name: beer.beer_name, brewery: brewery.brewery_name || '',
-                        style: beer.beer_style || '', score: null,
+                        beer_id: it.bid, name: it.name, brewery: it.brewery,
+                        style: it.style, score: it.score,
                     });
                 }
                 r.status = 'sicher';
-                r.selectedId = beer.bid;
+                r.selectedId = it.bid;
             } else if (hasResults) {
                 // Katalog kennt Kandidaten für diese Zeile, aber keiner davon
                 // ist in deiner Historie -> zuverlässig "noch nicht getrunken",
