@@ -181,20 +181,28 @@ $syncUrl = 'sync_web.php?token=' . rawurlencode($expected);
     button   { font-size: 1.1em; padding: .6em 1.4em; border-radius: 6px; border: 1px solid #888;
                cursor: pointer; margin: .5em 0; }
     /* Kompakte Ergebnisliste: eine Zeile pro Bier, Details nur auf Wunsch */
-    .row     { border-bottom: 1px solid #e5e5e5; padding: .45em 0; }
-    .row.neu-row  { background: #fafafa; }
-    .line1   { display: flex; align-items: baseline; gap: .4em; }
-    .dot     { flex: none; width: .7em; height: .7em; border-radius: 50%; }
-    .dot.sicher   { background: #1a7a1a; }
-    .dot.unsicher { background: #e5a50a; }
-    .dot.neu      { background: #bbb; }
+    .row     { border-bottom: 1px solid #e5e5e5; border-left: 4px solid transparent;
+               padding: .5em 0 .5em .6em; }
+    .row.neu-row  { background: #fff6e0; border-left-color: #e8a33d; }
+    .line1   { display: flex; align-items: baseline; gap: .45em; }
+    .status-mark { flex: none; }
+    .status-mark.sicher, .status-mark.unsicher { width: .7em; height: .7em; border-radius: 50%; }
+    .status-mark.sicher   { background: #1a7a1a; }
+    .status-mark.unsicher { background: #e5a50a; }
+    .status-mark.neu      { background: #e8a33d; color: #fff; font-size: .68em; font-weight: 700;
+                             letter-spacing: .03em; text-transform: uppercase; border-radius: 4px;
+                             padding: .2em .45em; }
     .input   { font-weight: 600; }
     .arrow   { color: #999; }
     .hit     { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hit.new-hit { color: #a5691c; font-weight: 700; white-space: normal; }
     .score   { color: #999; font-size: .8em; flex: none; }
     details  { margin: .2em 0 0 1.1em; }
     summary  { cursor: pointer; color: #666; font-size: .85em; }
     details label { display: block; padding: .3em 0; font-size: .95em; }
+    .live-search { margin: .35em 0 0 1.1em; }
+    .live-hit { display: flex; align-items: baseline; gap: .4em; padding: .2em 0; }
+    .live-hit .hit { font-size: .95em; }
     .ulink    { font-size: .8em; color: #b8791a; text-decoration: none; white-space: nowrap;
                 border: 1px solid #e0b070; border-radius: 999px; padding: .05em .45em; margin-left: .3em;
                 flex: none; }
@@ -205,6 +213,7 @@ $syncUrl = 'sync_web.php?token=' . rawurlencode($expected);
     .error { color: #b00020; font-weight: bold; }
     #summary { margin-top: 1em; }
     #counts  { font-size: .9em; color: #555; margin: .6em 0 .2em; }
+    #counts .new-count { color: #a5691c; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -237,6 +246,10 @@ Dogfish Head 90 Minute IPA"></textarea>
 
 <script>
 const TOKEN = <?= json_encode($expected) ?>;
+const CFG   = <?= json_encode([
+    'clientId'     => $config['client_id'],
+    'clientSecret' => $config['client_secret'],
+]) ?>;
 
 async function post(action, body) {
     const response = await fetch('match_web.php?token=' + encodeURIComponent(TOKEN) + '&action=' + action, {
@@ -256,6 +269,95 @@ async function post(action, body) {
 
 const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
 
+// --- Live-Suche im Untappd-Katalog für "noch nicht getrunken"-Zeilen -----
+// Läuft aus dem Browser (nicht vom Server), damit Cloudflare die Anfrage
+// nicht blockt – gleiches Prinzip wie beim Sync.
+function untappdSearchUrl(query) {
+    return 'https://api.untappd.com/v4/search/beer?q=' + encodeURIComponent(query)
+         + '&client_id=' + encodeURIComponent(CFG.clientId)
+         + '&client_secret=' + encodeURIComponent(CFG.clientSecret)
+         + '&limit=5';
+}
+
+function jsonp(url) {
+    return new Promise((resolve, reject) => {
+        const cb = 'untappd_cb_' + Math.random().toString(36).slice(2);
+        const script = document.createElement('script');
+        const cleanup = () => { delete window[cb]; script.remove(); };
+        window[cb] = data => { cleanup(); resolve(data); };
+        script.onerror = () => { cleanup(); reject(new Error('JSONP-Aufruf fehlgeschlagen')); };
+        script.src = url + '&callback=' + cb;
+        document.head.appendChild(script);
+    });
+}
+
+let useJsonpSearch = false;
+
+async function untappdSearch(query) {
+    const url = untappdSearchUrl(query);
+    if (!useJsonpSearch) {
+        try {
+            const response = await fetch(url, { referrerPolicy: 'no-referrer' });
+            return await response.json();
+        } catch (e) {
+            useJsonpSearch = true;
+        }
+    }
+    return jsonp(url);
+}
+
+function renderLiveResults(container, data) {
+    const meta  = data && data.meta ? data.meta : {};
+    if (meta.code !== 200) {
+        const rateLimited = meta.code === 429 || /limit/i.test(meta.error_detail || '');
+        container.innerHTML = '<span class="meta">'
+            + (rateLimited ? 'Untappd-Rate-Limit erreicht – bitte später erneut versuchen.'
+                           : 'Untappd-Suche fehlgeschlagen.')
+            + '</span>';
+        return rateLimited ? 'rate_limited' : 'error';
+    }
+
+    const items = (((data.response || {}).beers || {}).items) || [];
+    if (items.length === 0) {
+        container.innerHTML = '<span class="meta">Kein Untappd-Treffer.</span>';
+        return 'ok';
+    }
+
+    let html = '';
+    items.slice(0, 3).forEach(item => {
+        const beer = item.beer || {}, brewery = item.brewery || {};
+        html += '<div class="live-hit">'
+             + '<span class="hit">' + esc(beer.beer_name || '?') + ' <span class="meta">· '
+             + esc(brewery.brewery_name || '') + ' · ' + esc(beer.beer_style || '') + '</span></span>'
+             + '<a class="ulink" href="https://untappd.com/beer/' + (beer.bid || '')
+             + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>'
+             + '</div>';
+    });
+    container.innerHTML = html;
+    return 'ok';
+}
+
+// Sucht nacheinander (nicht parallel) – schont das Stundenlimit und bricht
+// bei einem Rate-Limit sauber ab, statt alle restlichen Zeilen scheitern zu lassen.
+async function runLiveSearches(containers) {
+    for (const { container, query } of containers) {
+        const data = await untappdSearch(query);
+        const status = renderLiveResults(container, data);
+        delete container.dataset.pending;   // fertig – egal ob Treffer, leer oder Fehler
+
+        if (status === 'rate_limited') {
+            containers.forEach(c => {
+                if (c.container.dataset.pending) {
+                    c.container.innerHTML = '<span class="meta">Nicht mehr durchsucht (Rate-Limit) – '
+                        + 'manuell über die Suche prüfen.</span>';
+                }
+            });
+            return;
+        }
+        await new Promise(r => setTimeout(r, 250));   // kleine Pause zwischen Anfragen
+    }
+}
+
 document.getElementById('matchBtn').addEventListener('click', async () => {
     const lines = document.getElementById('beerlist').value.split('\n');
     const resultsEl = document.getElementById('results');
@@ -266,6 +368,7 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
     try {
         const { results } = await post('match', { lines });
         resultsEl.innerHTML = '';
+        const liveSearchQueue = [];
 
         results.forEach((r, i) => {
             const row = document.createElement('div');
@@ -274,9 +377,9 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
 
             const best = r.candidates[0];
 
-            // Zeile 1: Status-Punkt, Eingabe, bester Treffer (bzw. Untappd-Suche)
+            // Zeile 1: Status-Markierung, Eingabe, bester Treffer (bzw. Untappd-Suche)
             let html = '<div class="line1">'
-                 + '<span class="dot ' + r.status + '"></span>'
+                 + '<span class="status-mark ' + r.status + '">' + (r.status === 'neu' ? 'NEU' : '') + '</span>'
                  + '<span class="input">' + esc(r.input) + '</span>';
 
             if (best) {
@@ -287,11 +390,15 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
                      + '<a class="ulink" href="https://untappd.com/beer/' + best.beer_id
                      + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>';
             } else {
-                html += '<span class="hit meta">noch nicht getrunken</span>'
+                html += '<span class="hit new-hit">noch nicht getrunken</span>'
                      + '<a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
                      + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a>';
             }
             html += '</div>';
+
+            if (!best) {
+                html += '<div class="live-search" data-pending="1"><span class="meta">Untappd wird durchsucht …</span></div>';
+            }
 
             // Zeile 2: Auswahl – immer eingeklappt, auch bei unsicherem Treffer
             if (best) {
@@ -325,31 +432,42 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
                 if (e.target.type !== 'radio') return;
                 const id   = parseInt(e.target.value, 10);
                 const hit  = row.querySelector('.line1 .hit');
-                const dot  = row.querySelector('.dot');
+                const mark = row.querySelector('.status-mark');
                 const cand = r.candidates.find(c => c.beer_id === id);
 
                 if (cand) {
                     hit.className = 'hit';
                     hit.innerHTML = esc(cand.name) + ' <span class="meta">· ' + esc(cand.brewery) + '</span>';
-                    dot.className = 'dot sicher';
+                    mark.className = 'status-mark sicher';
+                    mark.textContent = '';
                     row.classList.remove('neu-row');
                 } else {
-                    hit.className = 'hit meta';
+                    hit.className = 'hit new-hit';
                     hit.textContent = 'noch nicht getrunken';
-                    dot.className = 'dot neu';
+                    mark.className = 'status-mark neu';
+                    mark.textContent = 'NEU';
                     row.classList.add('neu-row');
                 }
             });
 
             resultsEl.appendChild(row);
+
+            if (!best) {
+                liveSearchQueue.push({ container: row.querySelector('.live-search'), query: r.input });
+            }
         });
 
         const counts = results.reduce((acc, r) => { acc[r.status]++; return acc; },
             { sicher: 0, unsicher: 0, neu: 0 });
-        document.getElementById('counts').textContent =
-            counts.sicher + ' Treffer · ' + counts.unsicher + ' zu prüfen · ' + counts.neu + ' noch nicht getrunken';
+        document.getElementById('counts').innerHTML =
+            counts.sicher + ' Treffer · ' + counts.unsicher + ' zu prüfen · '
+            + '<span class="new-count">' + counts.neu + ' noch nicht getrunken</span>';
 
         document.getElementById('saveBtn').style.display = results.length ? 'inline-block' : 'none';
+
+        if (liveSearchQueue.length > 0) {
+            runLiveSearches(liveSearchQueue);   // läuft im Hintergrund weiter
+        }
     } catch (e) {
         resultsEl.innerHTML = '<span class="error">FEHLER: ' + esc(e.message) + '</span>';
     }
