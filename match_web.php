@@ -228,13 +228,12 @@ $syncUrl = 'sync_web.php?token=' . rawurlencode($expected);
                padding: .5em 0 .5em .6em; }
     .row.neu-row  { background: #fff6e0; border-left-color: #e8a33d; }
     .line1   { display: flex; align-items: baseline; gap: .45em; }
-    .status-mark { flex: none; }
-    .status-mark.sicher, .status-mark.unsicher { width: .7em; height: .7em; border-radius: 50%; }
-    .status-mark.sicher   { background: #1a7a1a; }
-    .status-mark.unsicher { background: #e5a50a; }
-    .status-mark.neu      { background: #e8a33d; color: #fff; font-size: .68em; font-weight: 700;
-                             letter-spacing: .03em; text-transform: uppercase; border-radius: 4px;
-                             padding: .2em .45em; }
+    .drink-badge { flex: none; font-size: .68em; font-weight: 700; letter-spacing: .03em;
+                   text-transform: uppercase; border-radius: 4px; padding: .2em .45em; color: #fff; }
+    .drink-badge.pending  { background: #ccc; color: #555; }
+    .drink-badge.sicher   { background: #1a7a1a; }
+    .drink-badge.neu      { background: #e8a33d; }
+    .drink-badge.unsicher { background: #888; }
     .input   { font-weight: 600; }
     .arrow   { color: #999; }
     .hit     { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -297,6 +296,8 @@ const CFG   = <?= json_encode([
     'knownIds'     => $knownIds,
 ]) ?>;
 const KNOWN_IDS = new Set(CFG.knownIds);
+const BADGE_TEXT = { sicher: 'GETRUNKEN', neu: 'NEU', unsicher: 'NICHT GEFUNDEN' };
+let currentResults = [];
 
 async function post(action, body) {
     const response = await fetch('match_web.php?token=' + encodeURIComponent(TOKEN) + '&action=' + action, {
@@ -389,26 +390,26 @@ async function searchAndRerank(query) {
     }
 }
 
-// Rendert die Katalog-Kandidaten (bereits nach Textähnlichkeit sortiert)
-// und markiert jeden, der laut KNOWN_IDS bereits in deiner Historie steckt
-// (rein informativ, Häkchen). Für die automatische Übernahme als "sicher"
-// zählt dagegen NUR, ob der nach unserer eigenen Sortierung beste Treffer
-// (Position 0) bekannt ist – ein zufällig weiter unten stehender bekannter
-// Treffer soll nicht automatisch bestätigen, dass er zu DIESER Zeile gehört.
-// Rückgabe: { status, topRankedDrunkItem, hasResults }.
-function renderCatalogResults(container, result) {
-    if (result.status === 'rate_limited' || result.status === 'error') {
-        container.innerHTML = '<span class="meta">'
-            + (result.status === 'rate_limited' ? 'Untappd-Rate-Limit erreicht – bitte später erneut versuchen.'
-                                                 : 'Untappd-Suche fehlgeschlagen.')
-            + '</span>';
-        return { status: result.status, topRankedDrunkItem: null, hasResults: false };
+// Wertet das Katalog-Ergebnis rein aus (schreibt nichts ins DOM) – liefert
+// die fertige Live-Ergebnisliste als HTML-String plus die Entscheidungs-
+// grundlage für Badge/Auswahl. "topRankedDrunkItem" zählt NUR, wenn der
+// nach unserer eigenen Sortierung beste Treffer (Position 0) bekannt ist –
+// ein zufällig weiter unten stehender bekannter Treffer bestätigt nicht,
+// dass er zu DIESER Zeile gehört (bleibt aber informativ mit Häkchen sichtbar).
+function computeCatalogResult(searchResult) {
+    if (searchResult.status === 'rate_limited') {
+        return { status: 'rate_limited', topRankedDrunkItem: null, hasResults: false,
+                 liveHtml: '<span class="meta">Untappd-Rate-Limit erreicht – bitte später erneut versuchen.</span>' };
+    }
+    if (searchResult.status === 'error') {
+        return { status: 'error', topRankedDrunkItem: null, hasResults: false,
+                 liveHtml: '<span class="meta">Untappd-Suche fehlgeschlagen.</span>' };
     }
 
-    const items = result.items;
+    const items = searchResult.items;
     if (items.length === 0) {
-        container.innerHTML = '<span class="meta">Kein Untappd-Treffer.</span>';
-        return { status: 'ok', topRankedDrunkItem: null, hasResults: false };
+        return { status: 'ok', topRankedDrunkItem: null, hasResults: false,
+                 liveHtml: '<span class="meta">Kein Untappd-Treffer.</span>' };
     }
 
     const topRankedDrunkItem = KNOWN_IDS.has(items[0].bid) ? items[0] : null;
@@ -425,8 +426,7 @@ function renderCatalogResults(container, result) {
              + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>'
              + '</div>';
     });
-    container.innerHTML = html;
-    return { status: 'ok', topRankedDrunkItem, hasResults: true };
+    return { status: 'ok', topRankedDrunkItem, hasResults: true, liveHtml: html, items };
 }
 
 // Baut den kompletten Zeileninhalt aus dem aktuellen (ggf. durch die
@@ -435,27 +435,38 @@ function renderCatalogResults(container, result) {
 function buildRowHtml(r, i) {
     const selected = r.candidates.find(c => c.beer_id === r.selectedId);
 
+    const badgeKey  = r.catalogPending ? 'pending' : r.status;
+    const badgeText = r.catalogPending ? 'PRÜFT…' : (r.rateLimited ? 'NICHT GEPRÜFT' : BADGE_TEXT[r.status]);
+
     let html = '<div class="line1">'
-         + '<span class="status-mark ' + r.status + '">' + (r.status === 'neu' ? 'NEU' : '') + '</span>'
+         + '<span class="drink-badge ' + badgeKey + '">' + badgeText + '</span>'
          + '<span class="input">' + esc(r.input) + '</span>';
 
-    if (selected) {
+    if (r.catalogPending) {
+        html += '<span class="hit meta">wird mit Untappd abgeglichen …</span>';
+    } else if (selected) {
         html += '<span class="arrow">→</span>'
              + '<span class="hit">' + esc(selected.name) + ' <span class="meta">· '
              + esc(selected.brewery) + '</span></span>'
              + (selected.score != null ? '<span class="score">' + Math.round(selected.score * 100) + '%</span>' : '')
              + '<a class="ulink" href="https://untappd.com/beer/' + selected.beer_id
              + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>';
+    } else if (r.identifiedAs) {
+        const idf = r.identifiedAs;
+        html += '<span class="arrow">→</span>'
+             + '<span class="hit new-hit">' + esc(idf.name) + ' <span class="meta">· '
+             + esc(idf.brewery) + '</span></span>'
+             + (idf.score != null ? '<span class="score">' + Math.round(idf.score * 100) + '%</span>' : '')
+             + '<a class="ulink" href="https://untappd.com/beer/' + idf.bid
+             + '" target="_blank" rel="noopener noreferrer">Check-in&nbsp;↗</a>';
     } else {
-        html += '<span class="hit new-hit">noch nicht getrunken</span>'
+        html += '<span class="hit new-hit">kein Untappd-Treffer</span>'
              + '<a class="ulink" href="https://untappd.com/search?q=' + encodeURIComponent(r.input)
              + '" target="_blank" rel="noopener noreferrer">Suche&nbsp;↗</a>';
     }
     html += '</div>';
 
-    html += '<div class="live-search"><div class="live-results"' + (r._liveHtml ? '' : ' data-pending="1"') + '>'
-         + (r._liveHtml || '<span class="meta">Untappd-Katalog wird geprüft …</span>')
-         + '</div></div>';
+    html += '<div class="live-search"><div class="live-results">' + (r._liveHtml || '') + '</div></div>';
 
     if (r.candidates.length > 0) {
         html += '<details><summary>'
@@ -490,32 +501,40 @@ function buildRowHtml(r, i) {
 // bei einem Limit sauber ab, ohne bereits Geprüftes zu verwerfen.
 async function verifyRowsAgainstCatalog(rows) {
     for (const { row, r, i } of rows) {
-        const container = row.querySelector('.live-results');
-        const result = await searchAndRerank(r.input);
-        const { status, topRankedDrunkItem, hasResults } = renderCatalogResults(container, result);
-        r._liveHtml = container.innerHTML;
-        container.removeAttribute('data-pending');   // fertig – dieser Container zählt nicht mehr als "offen"
+        const searchResult = await searchAndRerank(r.input);
+        const result = computeCatalogResult(searchResult);
+        r._liveHtml = result.liveHtml;
 
-        if (status === 'rate_limited') {
-            rows.forEach(({ row: pendingRow }) => {
-                const c = pendingRow.querySelector('.live-results[data-pending]');
-                if (c) {
-                    c.innerHTML = '<span class="meta">Nicht mehr geprüft (Rate-Limit) – '
+        if (result.status === 'rate_limited') {
+            r.catalogPending = false;
+            r.rateLimited = true;
+            row.className = 'row' + (r.status === 'neu' ? ' neu-row' : '');
+            row.innerHTML = buildRowHtml(r, i);
+
+            rows.forEach(entry => {
+                if (entry.r.catalogPending) {
+                    entry.r.catalogPending = false;
+                    entry.r.rateLimited = true;
+                    entry.r._liveHtml = '<span class="meta">Nicht mehr geprüft (Rate-Limit) – '
                         + 'manuell über die Suche prüfen.</span>';
+                    entry.row.className = 'row' + (entry.r.status === 'neu' ? ' neu-row' : '');
+                    entry.row.innerHTML = buildRowHtml(entry.r, entry.i);
                 }
             });
+            updateCounts();
             break;
         }
 
-        // Nur automatisch übernehmen, wenn die Person diese Zeile noch nicht
-        // selbst verändert hat (ein Klick soll nie überschrieben werden) und
-        // die Suche selbst geklappt hat (bei einem Fehler bleibt der lokale
-        // Stand einfach unverändert stehen).
-        if (status === 'ok' && !row.dataset.userTouched) {
-            if (topRankedDrunkItem) {
+        if (row.dataset.userTouched) {
+            // Manuelle Wahl nicht überschreiben, nur die Katalog-Info nachreichen.
+            r.catalogPending = false;
+            const liveContainer = row.querySelector('.live-results');
+            if (liveContainer) liveContainer.innerHTML = result.liveHtml;
+        } else {
+            if (result.status === 'ok' && result.topRankedDrunkItem) {
                 // Bester Katalogtreffer (nach unserer eigenen Sortierung!) ist
                 // in deiner Historie -> sicher bestätigt.
-                const it = topRankedDrunkItem;
+                const it = result.topRankedDrunkItem;
                 if (!r.candidates.some(c => c.beer_id === it.bid)) {
                     r.candidates.unshift({
                         beer_id: it.bid, name: it.name, brewery: it.brewery,
@@ -524,17 +543,35 @@ async function verifyRowsAgainstCatalog(rows) {
                 }
                 r.status = 'sicher';
                 r.selectedId = it.bid;
-            } else if (hasResults) {
-                // Katalog kennt Kandidaten für diese Zeile, aber keiner davon
-                // ist in deiner Historie -> zuverlässig "noch nicht getrunken",
-                // auch wenn der lokale Abgleich vorher unsicher (oder fälschlich
-                // sicher) war. Das ist der eigentliche Zweck der Katalogprüfung.
+                r.identifiedAs = null;
+            } else if (result.status === 'ok' && result.hasResults) {
+                // Katalog kennt das Bier, aber es ist nicht in deiner Historie
+                // -> zuverlässig "neu", auch wenn der lokale Abgleich vorher
+                // unsicher (oder fälschlich sicher) war. Zeig, welches Bier
+                // es laut Katalog ist, auch ohne es als "getrunken" zu wählen.
                 r.status = 'neu';
                 r.selectedId = 0;
+                r.identifiedAs = result.items[0];
+                result.items.slice(0, 3).forEach(it => {
+                    if (!r.candidates.some(c => c.beer_id === it.bid)) {
+                        r.candidates.push({
+                            beer_id: it.bid, name: it.name, brewery: it.brewery,
+                            style: it.style, score: it.score,
+                        });
+                    }
+                });
+            } else if (result.status === 'ok') {
+                // Katalog fand überhaupt nichts -> ehrlich als "nicht gefunden"
+                // markieren, statt eine unsichere lokale Vermutung so aussehen
+                // zu lassen, als wäre sie bestätigt.
+                r.status = 'unsicher';
+                r.selectedId = 0;
+                r.identifiedAs = null;
             }
-            // Sonst (Katalog fand überhaupt nichts): keine zusätzliche
-            // Information -> lokalen Stand unverändert lassen.
+            // Sonst (status === 'error'): keine zusätzliche Information ->
+            // lokalen Stand unverändert lassen.
 
+            r.catalogPending = false;
             row.className = 'row' + (r.status === 'neu' ? ' neu-row' : '');
             row.innerHTML = buildRowHtml(r, i);
         }
@@ -544,14 +581,21 @@ async function verifyRowsAgainstCatalog(rows) {
     }
 }
 
-let currentResults = [];
-
 function updateCounts() {
-    const counts = currentResults.reduce((acc, r) => { acc[r.status]++; return acc; },
-        { sicher: 0, unsicher: 0, neu: 0 });
-    document.getElementById('counts').innerHTML =
-        counts.sicher + ' Treffer · ' + counts.unsicher + ' zu prüfen · '
-        + '<span class="new-count">' + counts.neu + ' noch nicht getrunken</span>';
+    const counts = currentResults.reduce((acc, r) => {
+        if (r.catalogPending) acc.pending++;
+        else if (r.rateLimited) acc.notChecked++;
+        else acc[r.status]++;
+        return acc;
+    }, { sicher: 0, unsicher: 0, neu: 0, pending: 0, notChecked: 0 });
+
+    const parts = [];
+    if (counts.sicher) parts.push(counts.sicher + ' getrunken');
+    if (counts.neu) parts.push('<span class="new-count">' + counts.neu + ' neu</span>');
+    if (counts.unsicher) parts.push(counts.unsicher + ' nicht gefunden');
+    if (counts.notChecked) parts.push(counts.notChecked + ' nicht geprüft');
+    if (counts.pending) parts.push(counts.pending + ' werden geprüft');
+    document.getElementById('counts').innerHTML = parts.join(' · ');
 }
 
 
@@ -573,9 +617,13 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
             row.className = 'row' + (r.status === 'neu' ? ' neu-row' : '');
             row.dataset.input = r.input;
 
-            // "sicher" startet vorausgewählt mit dem Top-Kandidaten, sonst
-            // ist "noch nicht getrunken" der sichere Default – siehe unten
-            // beim Katalogabgleich, der das ggf. überschreibt.
+            // Jede Zeile startet als "wird geprüft" – die Katalogverifikation
+            // liefert kurz danach den endgültigen Stand (getrunken/neu/nicht
+            // gefunden). "sicher" startet vorausgewählt mit dem Top-Kandidaten,
+            // sonst ist "noch nicht getrunken" der sichere Default.
+            r.catalogPending = true;
+            r.identifiedAs = null;
+            r.rateLimited = false;
             r.selectedId = (r.status === 'sicher' && r.candidates[0]) ? r.candidates[0].beer_id : 0;
 
             row.innerHTML = buildRowHtml(r, i);
@@ -586,26 +634,29 @@ document.getElementById('matchBtn').addEventListener('click', async () => {
             row.addEventListener('change', e => {
                 if (e.target.type !== 'radio') return;
                 row.dataset.userTouched = '1';
+                r.catalogPending = false;
 
-                const id   = parseInt(e.target.value, 10);
-                const hit  = row.querySelector('.line1 .hit');
-                const mark = row.querySelector('.status-mark');
-                const cand = r.candidates.find(c => c.beer_id === id);
+                const id    = parseInt(e.target.value, 10);
+                const hit   = row.querySelector('.line1 .hit');
+                const badge = row.querySelector('.drink-badge');
+                const cand  = r.candidates.find(c => c.beer_id === id);
 
                 if (cand) {
                     hit.className = 'hit';
                     hit.innerHTML = esc(cand.name) + ' <span class="meta">· ' + esc(cand.brewery) + '</span>';
-                    mark.className = 'status-mark sicher';
-                    mark.textContent = '';
+                    badge.className = 'drink-badge sicher';
+                    badge.textContent = 'GETRUNKEN';
                     row.classList.remove('neu-row');
                     r.status = 'sicher';
+                    r.selectedId = id;
                 } else {
                     hit.className = 'hit new-hit';
                     hit.textContent = 'noch nicht getrunken';
-                    mark.className = 'status-mark neu';
-                    mark.textContent = 'NEU';
+                    badge.className = 'drink-badge neu';
+                    badge.textContent = 'NEU';
                     row.classList.add('neu-row');
                     r.status = 'neu';
+                    r.selectedId = 0;
                 }
                 updateCounts();
             });
